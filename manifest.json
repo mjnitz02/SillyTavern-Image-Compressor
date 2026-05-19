@@ -1,0 +1,12 @@
+{
+    "display_name": "Image Compressor",
+    "loading_order": 150,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "mjnitz02",
+    "version": "1.0.0",
+    "homePage": "https://github.com/mjnitz02/SillyTavern-Image-Compressor",
+    "auto_update": true
+}
