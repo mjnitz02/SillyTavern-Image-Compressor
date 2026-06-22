@@ -17,6 +17,19 @@ async function probePlugin() {
     }
 }
 
+async function fetchStats(user) {
+    const res = await fetch(`${PLUGIN_BASE}/stats`, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ user }),
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || res.statusText);
+    }
+    return res.json();
+}
+
 async function fetchUsers() {
     try {
         const res = await fetch(`${PLUGIN_BASE}/users`, {
@@ -63,6 +76,9 @@ function buildPanel(users) {
                     <div id="imgcmp-reprocess" class="menu_button" style="flex:1; text-align:center;">
                         <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess All
                     </div>
+                    <div id="imgcmp-stats" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-chart-pie"></i>&nbsp;&nbsp;Stats
+                    </div>
                 </div>
                 <div id="imgcmp-progress-wrap" style="display:none; margin-bottom:8px;">
                     <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
@@ -81,7 +97,7 @@ function buildPanel(users) {
 }
 
 function setRunning(running) {
-    for (const id of ['imgcmp-run', 'imgcmp-reprocess', 'imgcmp-refresh']) {
+    for (const id of ['imgcmp-run', 'imgcmp-reprocess', 'imgcmp-refresh', 'imgcmp-stats']) {
         const el = document.getElementById(id);
         if (!el) continue;
         el.style.pointerEvents = running ? 'none' : '';
@@ -104,6 +120,47 @@ function appendLog(msg) {
     }
     el.textContent = lines.join('\n');
     el.scrollTop = el.scrollHeight;
+}
+
+// ── Stats display ───────────────────────────────────────────────────────────
+
+const STATS_TYPE_ORDER = ['png', 'jpg', 'gif', 'webp', 'other'];
+
+function appendDirStats(label, stats) {
+    appendLog(`${label}: ${stats.totalFiles.toLocaleString()} files, ${formatBytes(stats.totalBytes)}`);
+    for (const type of STATS_TYPE_ORDER) {
+        const t = stats.byType[type];
+        if (t.count === 0) continue;
+        appendLog(`  ${type.padEnd(5)} ${String(t.count).padStart(6)}  ${formatBytes(t.bytes)}`);
+    }
+}
+
+async function runStats() {
+    const user = document.getElementById('imgcmp-user')?.value;
+    if (!user) return;
+
+    const progressWrap = document.getElementById('imgcmp-progress-wrap');
+    const log = document.getElementById('imgcmp-log');
+
+    log.textContent = '';
+    log.style.display = 'none';
+    progressWrap.style.display = 'none';
+    setRunning(true);
+
+    try {
+        const stats = await fetchStats(user);
+        appendLog('Images (user/images/):');
+        appendDirStats('  Total', stats.images);
+        appendLog('');
+        appendLog('Characters:');
+        appendDirStats('  Total', stats.characters);
+    } catch (err) {
+        appendLog(`Error: ${err.message}`);
+        console.error(MODULE_NAME, err);
+        toastr.error('Failed to load stats. See the log for details.', 'Image Compressor');
+    } finally {
+        setRunning(false);
+    }
 }
 
 // ── Job runner ───────────────────────────────────────────────────────────────
@@ -175,6 +232,19 @@ async function runJob(endpoint) {
                             for (const e of r.errors) appendLog(`  ${e}`);
                         }
                         toastr.success(`Saved ${formatBytes(r.bytesSaved)} across ${r.filesCompressed.toLocaleString()} files`, 'Image Compressor');
+
+                        try {
+                            const stats = await fetchStats(user);
+                            appendLog('');
+                            appendLog('Current state:');
+                            appendLog('Images (user/images/):');
+                            appendDirStats('  Total', stats.images);
+                            appendLog('');
+                            appendLog('Characters:');
+                            appendDirStats('  Total', stats.characters);
+                        } catch {
+                            // stats are a nice-to-have after a run; ignore failures here
+                        }
                     }
                 } catch {
                     // malformed SSE line, skip
@@ -212,6 +282,7 @@ function injectPanel(users) {
     document.getElementById('imgcmp-refresh').addEventListener('click', refreshUsers);
     document.getElementById('imgcmp-run').addEventListener('click', () => runJob(`${PLUGIN_BASE}/compress`));
     document.getElementById('imgcmp-reprocess').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-all`));
+    document.getElementById('imgcmp-stats').addEventListener('click', runStats);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
