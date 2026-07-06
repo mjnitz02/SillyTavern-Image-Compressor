@@ -21,6 +21,8 @@ PNG files are compressed using [pngquant](https://pngquant.org/), which converts
 
 **Character cards** receive special treatment: the `tEXt` chunk embedded in the PNG (which stores the character definition JSON) is extracted before compression and re-injected afterward. This means character data is fully preserved and the card remains importable after compression.
 
+On top of that, the **Repair Characters** action performs a lightweight card upgrade in the same pass. It only fixes things that are actually broken — it never rewrites prose, clears prompts, or filters tags. Specifically it upgrades V2 cards to V3, backfills required V3 fields (`group_only_greetings`, `character_book.extensions`, per-entry `use_regex`), and normalises malformed template tokens (e.g. `{char}` → `{{char}}`, and broken pronoun aliases like `{{sub}}`/`{{obj}}`/`{{poss}}` → `{{user}}`). All other metadata — including extension data such as `gallery_id`/`fav` and `_meta` — is preserved. A card is written back whenever it changed or the image shrank, so a repair is never lost.
+
 **Gallery images** are additionally capped at 2048px on the longest side before quantization. Images already within that dimension are passed straight to pngquant.
 
 Files where pngquant's output would be *larger* than the original are left untouched (`--skip-if-larger`).
@@ -33,22 +35,29 @@ Files where re-encoding produces a larger result are left untouched.
 
 ### State tracking
 
-The extension tracks which files have already been processed in `data/{user}/.compress_state.json`. Each entry records the file path and its compressed size. On subsequent runs, a file is only reprocessed if its size has changed (e.g. a new download replaced it). This makes repeated runs fast — only new or changed files are touched.
+The extension tracks which files have already been processed so repeated runs stay fast — a file is only reprocessed if its size has changed (e.g. a new download replaced it). Images and characters track state independently: image compression uses `data/{user}/.compress_state.json` and character repair uses `data/{user}/.repair_state.json`. Keeping them separate means a card already compressed by an image pass isn't skipped before it can be repaired.
 
 ## How to use
 
 Open the **Extensions** panel and find **Image Compressor**.
 
 1. Select a user from the dropdown. The list is populated from your `data/` directory — only folders containing a `settings.json` are shown.
-2. Click **Compress** to run a normal pass. Files already processed in a previous run are skipped.
-3. Click **Reprocess All** to clear the state file and compress everything from scratch. Use this if you want to re-run after a pngquant or quality setting change.
 
-A progress bar updates every 50 files during the run. When complete, the log shows a summary:
+The controls are grouped into two rows:
+
+- **Repair Characters** — compresses `characters/` and upgrades/repairs each embedded card (see [Character cards](#character-cards) above). Files processed in a previous run are skipped.
+- **Compress Images** — compresses `user/images/` only. Files processed in a previous run are skipped.
+- **Reprocess Characters** — clears the character state file and re-runs Repair Characters on every card from scratch.
+- **Reprocess Images** — clears the image state file and compresses every image from scratch. Use this after a pngquant or quality setting change.
+- **Stats** — shows current file counts and sizes without modifying anything.
+
+A progress bar updates during the run. When complete, the log shows a summary (the `Repaired` line appears only for character runs):
 
 ```
 Scanned:    1,842
 Skipped:    1,204
 Compressed: 638
+Repaired:   57
 Saved:      312.4 MB
 ```
 

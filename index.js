@@ -69,12 +69,20 @@ function buildPanel(users) {
                         <i class="fa-solid fa-rotate-right"></i>
                     </div>
                 </div>
-                <div style="display:flex; gap:8px; margin-bottom:12px;">
-                    <div id="imgcmp-run" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-compress"></i>&nbsp;&nbsp;Compress
+                <div style="display:flex; gap:8px; margin-bottom:8px;">
+                    <div id="imgcmp-upgrade-chars" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i>&nbsp;&nbsp;Repair Characters
                     </div>
-                    <div id="imgcmp-reprocess" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess All
+                    <div id="imgcmp-compress-images" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-compress"></i>&nbsp;&nbsp;Compress Images
+                    </div>
+                </div>
+                <div style="display:flex; gap:8px; margin-bottom:12px;">
+                    <div id="imgcmp-reprocess-chars" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess Characters
+                    </div>
+                    <div id="imgcmp-reprocess-images" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess Images
                     </div>
                     <div id="imgcmp-stats" class="menu_button" style="flex:1; text-align:center;">
                         <i class="fa-solid fa-chart-pie"></i>&nbsp;&nbsp;Stats
@@ -96,8 +104,17 @@ function buildPanel(users) {
     return div;
 }
 
+const BUTTON_IDS = [
+    'imgcmp-upgrade-chars',
+    'imgcmp-compress-images',
+    'imgcmp-reprocess-chars',
+    'imgcmp-reprocess-images',
+    'imgcmp-refresh',
+    'imgcmp-stats',
+];
+
 function setRunning(running) {
-    for (const id of ['imgcmp-run', 'imgcmp-reprocess', 'imgcmp-refresh', 'imgcmp-stats']) {
+    for (const id of BUTTON_IDS) {
         const el = document.getElementById(id);
         if (!el) continue;
         el.style.pointerEvents = running ? 'none' : '';
@@ -165,7 +182,7 @@ async function runStats() {
 
 // ── Job runner ───────────────────────────────────────────────────────────────
 
-async function runJob(endpoint) {
+async function runJob(endpoint, kind = 'images') {
     const user = document.getElementById('imgcmp-user')?.value;
     if (!user) return;
 
@@ -226,12 +243,19 @@ async function runJob(endpoint) {
                         appendLog(`Scanned:    ${r.filesScanned.toLocaleString()}`);
                         appendLog(`Skipped:    ${r.filesSkipped.toLocaleString()}`);
                         appendLog(`Compressed: ${r.filesCompressed.toLocaleString()}`);
+                        if (kind === 'characters') {
+                            appendLog(`Repaired:   ${(r.cardsRepaired ?? 0).toLocaleString()}`);
+                        }
                         appendLog(`Saved:      ${formatBytes(r.bytesSaved)}`);
                         if (r.errors.length > 0) {
                             appendLog(`\nErrors (${r.errors.length}):`);
                             for (const e of r.errors) appendLog(`  ${e}`);
                         }
-                        toastr.success(`Saved ${formatBytes(r.bytesSaved)} across ${r.filesCompressed.toLocaleString()} files`, 'Image Compressor');
+                        const savedMsg = `Saved ${formatBytes(r.bytesSaved)} across ${r.filesCompressed.toLocaleString()} files`;
+                        const summary = kind === 'characters'
+                            ? `Repaired ${(r.cardsRepaired ?? 0).toLocaleString()} cards. ${savedMsg}`
+                            : savedMsg;
+                        toastr.success(summary, 'Image Compressor');
 
                         try {
                             const stats = await fetchStats(user);
@@ -280,8 +304,10 @@ function injectPanel(users) {
     container.appendChild(panel);
 
     document.getElementById('imgcmp-refresh').addEventListener('click', refreshUsers);
-    document.getElementById('imgcmp-run').addEventListener('click', () => runJob(`${PLUGIN_BASE}/compress`));
-    document.getElementById('imgcmp-reprocess').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-all`));
+    document.getElementById('imgcmp-upgrade-chars').addEventListener('click', () => runJob(`${PLUGIN_BASE}/upgrade-characters`, 'characters'));
+    document.getElementById('imgcmp-compress-images').addEventListener('click', () => runJob(`${PLUGIN_BASE}/compress`, 'images'));
+    document.getElementById('imgcmp-reprocess-chars').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-characters`, 'characters'));
+    document.getElementById('imgcmp-reprocess-images').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-all`, 'images'));
     document.getElementById('imgcmp-stats').addEventListener('click', runStats);
 }
 
@@ -291,9 +317,11 @@ const available = await probePlugin();
 
 if (!available) {
     toastr.warning(
-        'Image Compressor server plugin is not available.',
+        'Image Compressor server plugin is not available. If you just cloned it into '
+        + 'SillyTavern/plugins, run <b>npm install --omit=dev</b> in the plugin folder and '
+        + 'restart SillyTavern. (No build step is needed — the plugin ships pre-built.)',
         'Image Compressor',
-        { timeOut: 0, closeButton: true },
+        { timeOut: 0, closeButton: true, escapeHtml: false },
     );
 } else {
     const users = await fetchUsers();
