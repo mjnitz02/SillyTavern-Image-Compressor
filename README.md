@@ -1,6 +1,6 @@
 # SillyTavern Image Compressor
 
-**Requires the companion server plugin: [SillyTavern-Image-Compressor-Server](https://github.com/mjnitz02/SillyTavern-Image-Compressor-Server)**
+**Requires the companion server plugin: [SillyTavern-Image-Compressor-Server](https://github.com/EnchantedRobot/SillyTavern-Image-Compressor-Server)**
 
 A SillyTavern extension that compresses PNG and JPEG images in your user directory to reduce disk usage. Large SillyTavern installs commonly accumulate gigabytes of character cards and gallery images — this extension can significantly reduce that footprint with no visible quality loss for typical use.
 
@@ -70,14 +70,14 @@ Any files that could not be processed (corrupt images, permission errors) are li
 2. In SillyTavern, go to **Extensions → Install extension** and enter:
 
 ```
-https://github.com/mjnitz02/SillyTavern-Image-Compressor
+https://github.com/EnchantedRobot/SillyTavern-Image-Compressor
 ```
 
 Or clone it manually into your user extensions directory:
 
 ```bash
 cd data/default-user/extensions
-git clone https://github.com/mjnitz02/SillyTavern-Image-Compressor
+git clone https://github.com/EnchantedRobot/SillyTavern-Image-Compressor
 ```
 
 3. Reload SillyTavern. The extension will appear in the Extensions panel. If the server plugin is not running, a warning toast will appear on load.
