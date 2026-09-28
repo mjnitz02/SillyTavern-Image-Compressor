@@ -151,12 +151,18 @@ async function isAnimated(blob, ext) {
 
 // ── Conversion ───────────────────────────────────────────────────────────────
 
-/** Safari's canvas silently falls back to PNG when asked for WEBP. */
+/**
+ * Safari's canvas silently falls back to PNG when asked for WEBP. The canvas
+ * needs a context first: Chrome rejects convertToBlob on one that has none.
+ */
 async function canEncodeWebp() {
     try {
-        const blob = await new OffscreenCanvas(1, 1).convertToBlob({ type: 'image/webp' });
+        const canvas = new OffscreenCanvas(1, 1);
+        canvas.getContext('2d');
+        const blob = await canvas.convertToBlob({ type: 'image/webp' });
         return blob.type === 'image/webp';
-    } catch {
+    } catch (err) {
+        console.error(MODULE_NAME, 'WEBP probe failed', err);
         return false;
     }
 }
@@ -338,7 +344,7 @@ async function runConvert() {
     resetLog();
 
     if (!(await canEncodeWebp())) {
-        appendLog('Error: this browser cannot encode WEBP (Safari). Run the conversion from Chrome or Firefox.');
+        appendLog('Error: this browser cannot encode WEBP. Run the conversion from Chrome, Edge or Firefox (see the console for details).');
         toastr.error('This browser cannot encode WEBP.', 'Image Compressor');
         return;
     }
