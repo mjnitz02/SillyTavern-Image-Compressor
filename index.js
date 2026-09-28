@@ -1,58 +1,228 @@
 const { getRequestHeaders } = SillyTavern.getContext();
 
 const MODULE_NAME = '[Image Compressor]';
-const PLUGIN_BASE = '/api/plugins/image-compressor';
+
+const WEBP_QUALITY = 0.82;
+const MAX_DIMENSION = 2048;
+const MIN_DIMENSION = 512;
+
+// Vector art has nothing to gain from a raster WEBP, so it's left alone.
+const SKIP_EXTS = new Set(['webp', 'svg']);
 
 // ── API helpers ──────────────────────────────────────────────────────────────
+// Everything goes through SillyTavern's own gallery endpoints, which act on the
+// logged-in user's `user/images/` — no server plugin needed.
 
-async function probePlugin() {
-    try {
-        const res = await fetch(`${PLUGIN_BASE}/probe`, {
-            method: 'POST',
-            headers: getRequestHeaders(),
-        });
-        return res.ok;
-    } catch {
-        return false;
-    }
-}
-
-async function fetchStats(user) {
-    const res = await fetch(`${PLUGIN_BASE}/stats`, {
+async function postJson(url, body) {
+    const res = await fetch(url, {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify({ user }),
+        body: JSON.stringify(body),
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(err.error || res.statusText);
     }
-    return res.json();
+    return res;
 }
 
-async function fetchUsers() {
+async function listFolders() {
+    return (await postJson('/api/images/folders', {})).json();
+}
+
+async function listImages(folder) {
+    return (await postJson('/api/images/list', { folder, sortField: 'name', sortOrder: 'asc' })).json();
+}
+
+function imageUrl(folder, file) {
+    return `/user/images/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`;
+}
+
+async function fetchImage(folder, file) {
+    const res = await fetch(imageUrl(folder, file), { headers: getRequestHeaders() });
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+    return res.blob();
+}
+
+async function uploadWebp(folder, file, blob) {
+    const image = await blobToBase64(blob);
+    const res = await postJson('/api/images/upload', { image, format: 'webp', ch_name: folder, filename: file });
+    return (await res.json()).path;
+}
+
+async function deleteImage(folder, file) {
+    await postJson('/api/images/delete', { path: `user/images/${folder}/${file}` });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatBytes(n) {
+    const sign = n < 0 ? '-' : '';
+    n = Math.abs(n);
+    if (n < 1024) return `${sign}${n} B`;
+    if (n < 1024 * 1024) return `${sign}${(n / 1024).toFixed(1)} KB`;
+    return `${sign}${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function extOf(file) {
+    const m = /\.([^.]+)$/.exec(file);
+    return m ? m[1].toLowerCase() : '';
+}
+
+// Mirrors SillyTavern's removeFileExtension, which the upload endpoint applies.
+function stemOf(file) {
+    return file.replace(/\.[^.]+$/, '');
+}
+
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1]);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+}
+
+function computeScaledDimensions(w, h) {
+    if (Math.max(w, h) <= MAX_DIMENSION) return null;
+    let scale = MAX_DIMENSION / Math.max(w, h);
+    if (Math.min(w, h) * scale < MIN_DIMENSION) {
+        scale = MIN_DIMENSION / Math.min(w, h);
+    }
+    if (scale >= 1) return null;
+    return { w: Math.round(w * scale), h: Math.round(h * scale) };
+}
+
+// ── Animation detection ──────────────────────────────────────────────────────
+// A canvas only ever draws the first frame, so animated images must be skipped
+// or they'd be flattened to a still.
+
+/** Walks the GIF block structure and reports whether it has more than one frame. */
+function isAnimatedGif(bytes) {
+    if (bytes.length < 13) return false;
+    let pos = 13;
+    const packed = bytes[10];
+    if (packed & 0x80) pos += 3 * (1 << ((packed & 0x07) + 1)); // global color table
+
+    const skipSubBlocks = () => {
+        while (pos < bytes.length && bytes[pos] !== 0) pos += bytes[pos] + 1;
+        pos++; // block terminator
+    };
+
+    let frames = 0;
+    while (pos < bytes.length) {
+        const block = bytes[pos];
+        if (block === 0x2c) { // image descriptor
+            if (++frames > 1) return true;
+            const localPacked = bytes[pos + 9];
+            pos += 10;
+            if (localPacked & 0x80) pos += 3 * (1 << ((localPacked & 0x07) + 1));
+            pos++; // LZW minimum code size
+            skipSubBlocks();
+        } else if (block === 0x21) { // extension
+            pos += 2;
+            skipSubBlocks();
+        } else {
+            break; // trailer (0x3b) or corrupt
+        }
+    }
+    return false;
+}
+
+/** An APNG declares an `acTL` chunk before its first `IDAT`. */
+function isAnimatedPng(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let pos = 8;
+    while (pos + 8 <= bytes.length) {
+        const length = view.getUint32(pos);
+        const type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+        if (type === 'acTL') return true;
+        if (type === 'IDAT') return false;
+        pos += 12 + length;
+    }
+    return false;
+}
+
+async function isAnimated(blob, ext) {
+    if (ext !== 'gif' && ext !== 'png') return false;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return ext === 'gif' ? isAnimatedGif(bytes) : isAnimatedPng(bytes);
+}
+
+// ── Conversion ───────────────────────────────────────────────────────────────
+
+/** Safari's canvas silently falls back to PNG when asked for WEBP. */
+async function canEncodeWebp() {
     try {
-        const res = await fetch(`${PLUGIN_BASE}/users`, {
-            headers: getRequestHeaders(),
-        });
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data.users ?? [];
+        const blob = await new OffscreenCanvas(1, 1).convertToBlob({ type: 'image/webp' });
+        return blob.type === 'image/webp';
     } catch {
-        return [];
+        return false;
     }
 }
 
-function formatBytes(n) {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+async function encodeWebp(blob) {
+    const bitmap = await createImageBitmap(blob);
+    try {
+        const dims = computeScaledDimensions(bitmap.width, bitmap.height);
+        const w = dims?.w ?? bitmap.width;
+        const h = dims?.h ?? bitmap.height;
+        const canvas = new OffscreenCanvas(w, h);
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        const webp = await canvas.convertToBlob({ type: 'image/webp', quality: WEBP_QUALITY });
+        if (webp.type !== 'image/webp') throw new Error('browser cannot encode WEBP');
+        return { webp, resized: dims !== null };
+    } finally {
+        bitmap.close();
+    }
+}
+
+/**
+ * Converts one image in place to `<stem>.webp`. There's no state file: a WEBP
+ * is the finished form, so the next run skips it — which is also why the
+ * conversion is unconditional rather than only-if-smaller.
+ */
+async function convertFile(folder, file, existing, result) {
+    const ext = extOf(file);
+    if (SKIP_EXTS.has(ext)) {
+        result.skipped++;
+        return;
+    }
+
+    const target = `${stemOf(file)}.webp`;
+    if (existing.has(target.toLowerCase())) {
+        result.errors.push(`${folder}/${file}: ${target} already exists, left untouched`);
+        return;
+    }
+
+    const original = await fetchImage(folder, file);
+    if (await isAnimated(original, ext)) {
+        result.animated++;
+        return;
+    }
+
+    const { webp, resized } = await encodeWebp(original);
+
+    // Only drop the original once the WEBP has landed exactly where expected —
+    // the server sanitizes names, and a mismatch would otherwise lose the file.
+    const expected = `/user/images/${folder}/${target}`;
+    const written = await uploadWebp(folder, file, webp);
+    if (written !== expected) {
+        throw new Error(`upload landed at ${written}, expected ${expected}; original kept`);
+    }
+    await deleteImage(folder, file);
+    existing.add(target.toLowerCase());
+
+    result.converted++;
+    result.bytesSaved += original.size - webp.size;
+    console.log(MODULE_NAME, `${folder}/${file} -> ${target}: ${formatBytes(original.size)} -> ${formatBytes(webp.size)}${resized ? ' (resized)' : ''}`);
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────
 
-function buildPanel(users) {
-    const options = users.map(u => `<option value="${u}">${u}</option>`).join('');
+function buildPanel() {
     const div = document.createElement('div');
     div.id = 'imgcmp-panel';
     div.innerHTML = `
@@ -62,27 +232,9 @@ function buildPanel(users) {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
-                    <label for="imgcmp-user" style="white-space:nowrap; font-size:13px;">User</label>
-                    <select id="imgcmp-user" class="text_pole" style="flex:1;">${options}</select>
-                    <div id="imgcmp-refresh" class="menu_button" title="Refresh user list" style="padding:4px 9px;">
-                        <i class="fa-solid fa-rotate-right"></i>
-                    </div>
-                </div>
-                <div style="display:flex; gap:8px; margin-bottom:8px;">
-                    <div id="imgcmp-upgrade-chars" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-wand-magic-sparkles"></i>&nbsp;&nbsp;Repair Characters
-                    </div>
-                    <div id="imgcmp-compress-images" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-compress"></i>&nbsp;&nbsp;Compress Images
-                    </div>
-                </div>
                 <div style="display:flex; gap:8px; margin-bottom:12px;">
-                    <div id="imgcmp-reprocess-chars" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess Characters
-                    </div>
-                    <div id="imgcmp-reprocess-images" class="menu_button" style="flex:1; text-align:center;">
-                        <i class="fa-solid fa-rotate"></i>&nbsp;&nbsp;Reprocess Images
+                    <div id="imgcmp-convert" class="menu_button" style="flex:1; text-align:center;">
+                        <i class="fa-solid fa-compress"></i>&nbsp;&nbsp;Convert Images to WEBP
                     </div>
                     <div id="imgcmp-stats" class="menu_button" style="flex:1; text-align:center;">
                         <i class="fa-solid fa-chart-pie"></i>&nbsp;&nbsp;Stats
@@ -104,14 +256,7 @@ function buildPanel(users) {
     return div;
 }
 
-const BUTTON_IDS = [
-    'imgcmp-upgrade-chars',
-    'imgcmp-compress-images',
-    'imgcmp-reprocess-chars',
-    'imgcmp-reprocess-images',
-    'imgcmp-refresh',
-    'imgcmp-stats',
-];
+const BUTTON_IDS = ['imgcmp-convert', 'imgcmp-stats'];
 
 function setRunning(running) {
     for (const id of BUTTON_IDS) {
@@ -139,38 +284,40 @@ function appendLog(msg) {
     el.scrollTop = el.scrollHeight;
 }
 
-// ── Stats display ───────────────────────────────────────────────────────────
-
-const STATS_TYPE_ORDER = ['png', 'jpg', 'gif', 'webp', 'other'];
-
-function appendDirStats(label, stats) {
-    appendLog(`${label}: ${stats.totalFiles.toLocaleString()} files, ${formatBytes(stats.totalBytes)}`);
-    for (const type of STATS_TYPE_ORDER) {
-        const t = stats.byType[type];
-        if (t.count === 0) continue;
-        appendLog(`  ${type.padEnd(5)} ${String(t.count).padStart(6)}  ${formatBytes(t.bytes)}`);
-    }
-}
-
-async function runStats() {
-    const user = document.getElementById('imgcmp-user')?.value;
-    if (!user) return;
-
-    const progressWrap = document.getElementById('imgcmp-progress-wrap');
+function resetLog() {
     const log = document.getElementById('imgcmp-log');
-
     log.textContent = '';
     log.style.display = 'none';
-    progressWrap.style.display = 'none';
+}
+
+/** Every image in every `user/images/<folder>/`, as `{ folder, file }` pairs. */
+async function collectImages() {
+    const images = [];
+    for (const folder of await listFolders()) {
+        for (const file of await listImages(folder)) images.push({ folder, file });
+    }
+    return images;
+}
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+
+async function runStats() {
+    resetLog();
+    document.getElementById('imgcmp-progress-wrap').style.display = 'none';
     setRunning(true);
 
     try {
-        const stats = await fetchStats(user);
-        appendLog('Images (user/images/):');
-        appendDirStats('  Total', stats.images);
-        appendLog('');
-        appendLog('Characters:');
-        appendDirStats('  Total', stats.characters);
+        const images = await collectImages();
+        const byType = new Map();
+        for (const { file } of images) {
+            const ext = extOf(file) || '(none)';
+            byType.set(ext, (byType.get(ext) ?? 0) + 1);
+        }
+        const folders = new Set(images.map(i => i.folder)).size;
+        appendLog(`user/images/: ${images.length.toLocaleString()} images in ${folders.toLocaleString()} folders`);
+        for (const [ext, count] of [...byType].sort((a, b) => b[1] - a[1])) {
+            appendLog(`  ${ext.padEnd(6)} ${String(count).padStart(6)}`);
+        }
     } catch (err) {
         appendLog(`Error: ${err.message}`);
         console.error(MODULE_NAME, err);
@@ -182,103 +329,72 @@ async function runStats() {
 
 // ── Job runner ───────────────────────────────────────────────────────────────
 
-async function runJob(endpoint, kind = 'images') {
-    const user = document.getElementById('imgcmp-user')?.value;
-    if (!user) return;
-
+async function runConvert() {
     const progressWrap = document.getElementById('imgcmp-progress-wrap');
     const bar = document.getElementById('imgcmp-bar');
     const label = document.getElementById('imgcmp-progress-label');
     const pct = document.getElementById('imgcmp-progress-pct');
-    const log = document.getElementById('imgcmp-log');
 
-    // Reset UI
-    log.textContent = '';
-    log.style.display = 'none';
+    resetLog();
+
+    if (!(await canEncodeWebp())) {
+        appendLog('Error: this browser cannot encode WEBP (Safari). Run the conversion from Chrome or Firefox.');
+        toastr.error('This browser cannot encode WEBP.', 'Image Compressor');
+        return;
+    }
+
     bar.style.width = '0%';
     pct.textContent = '0%';
     label.textContent = 'Scanning files...';
     progressWrap.style.display = 'block';
     setRunning(true);
 
+    const result = { scanned: 0, skipped: 0, animated: 0, converted: 0, bytesSaved: 0, errors: [] };
+
     try {
-        const res = await fetch(endpoint, {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify({ user }),
-        });
+        const images = await collectImages();
+        result.scanned = images.length;
 
-        if (!res.ok) {
-            const err = await res.json().catch(() => ({ error: res.statusText }));
-            appendLog(`Error: ${err.error}`);
-            toastr.error(err.error, 'Image Compressor');
-            return;
+        // Lower-cased names per folder, to catch a conversion that would
+        // overwrite an existing `<stem>.webp`.
+        const existingByFolder = new Map();
+        for (const { folder, file } of images) {
+            if (!existingByFolder.has(folder)) existingByFolder.set(folder, new Set());
+            existingByFolder.get(folder).add(file.toLowerCase());
         }
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() ?? '';
-
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                try {
-                    const event = JSON.parse(line.slice(6));
-                    if (event.type === 'progress') {
-                        bar.style.width = `${event.percent}%`;
-                        pct.textContent = `${event.percent}%`;
-                        label.textContent = `Processing... ${event.current.toLocaleString()} / ${event.total.toLocaleString()}`;
-                    } else if (event.type === 'complete') {
-                        const r = event.result;
-                        bar.style.width = '100%';
-                        pct.textContent = '100%';
-                        label.textContent = 'Done';
-                        appendLog(`Scanned:    ${r.filesScanned.toLocaleString()}`);
-                        appendLog(`Skipped:    ${r.filesSkipped.toLocaleString()}`);
-                        appendLog(`Compressed: ${r.filesCompressed.toLocaleString()}`);
-                        if (kind === 'characters') {
-                            appendLog(`Repaired:   ${(r.cardsRepaired ?? 0).toLocaleString()}`);
-                        }
-                        appendLog(`Saved:      ${formatBytes(r.bytesSaved)}`);
-                        if (r.errors.length > 0) {
-                            appendLog(`\nErrors (${r.errors.length}):`);
-                            for (const e of r.errors) appendLog(`  ${e}`);
-                        }
-                        const savedMsg = `Saved ${formatBytes(r.bytesSaved)} across ${r.filesCompressed.toLocaleString()} files`;
-                        const summary = kind === 'characters'
-                            ? `Repaired ${(r.cardsRepaired ?? 0).toLocaleString()} cards. ${savedMsg}`
-                            : savedMsg;
-                        toastr.success(summary, 'Image Compressor');
-
-                        try {
-                            const stats = await fetchStats(user);
-                            appendLog('');
-                            appendLog('Current state:');
-                            appendLog('Images (user/images/):');
-                            appendDirStats('  Total', stats.images);
-                            appendLog('');
-                            appendLog('Characters:');
-                            appendDirStats('  Total', stats.characters);
-                        } catch {
-                            // stats are a nice-to-have after a run; ignore failures here
-                        }
-                    }
-                } catch {
-                    // malformed SSE line, skip
-                }
+        let current = 0;
+        for (const { folder, file } of images) {
+            current++;
+            try {
+                await convertFile(folder, file, existingByFolder.get(folder), result);
+            } catch (err) {
+                result.errors.push(`${folder}/${file}: ${err.message}`);
+                console.error(MODULE_NAME, `${folder}/${file}`, err);
             }
+            const percent = Math.round((current / images.length) * 100);
+            bar.style.width = `${percent}%`;
+            pct.textContent = `${percent}%`;
+            label.textContent = `Processing... ${current.toLocaleString()} / ${images.length.toLocaleString()}`;
         }
+
+        bar.style.width = '100%';
+        pct.textContent = '100%';
+        label.textContent = 'Done';
+        appendLog(`Scanned:    ${result.scanned.toLocaleString()}`);
+        appendLog(`Skipped:    ${result.skipped.toLocaleString()}`);
+        appendLog(`Animated:   ${result.animated.toLocaleString()}`);
+        appendLog(`Converted:  ${result.converted.toLocaleString()}`);
+        appendLog(`Saved:      ${formatBytes(result.bytesSaved)}`);
+        if (result.errors.length > 0) {
+            appendLog(`\nErrors (${result.errors.length}):`);
+            for (const e of result.errors) appendLog(`  ${e}`);
+        }
+        toastr.success(`Converted ${result.converted.toLocaleString()} images, saved ${formatBytes(result.bytesSaved)}`, 'Image Compressor');
     } catch (err) {
         appendLog(`Error: ${err.message}`);
         console.error(MODULE_NAME, err);
-        toastr.error('Compression failed. See the log for details.', 'Image Compressor');
+        toastr.error('Conversion failed. See the log for details.', 'Image Compressor');
     } finally {
         setRunning(false);
     }
@@ -286,57 +402,25 @@ async function runJob(endpoint, kind = 'images') {
 
 // ── Settings panel injection ─────────────────────────────────────────────────
 
-async function refreshUsers() {
-    const users = await fetchUsers();
-    const select = document.getElementById('imgcmp-user');
-    if (!select) return;
-    const current = select.value;
-    select.innerHTML = users.map(u => `<option value="${u}">${u}</option>`).join('');
-    if (users.includes(current)) select.value = current;
-}
-
-function injectPanel(users) {
+function injectPanel(container) {
     if (document.getElementById('imgcmp-panel')) return;
-    const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
-    if (!container) return;
-
-    const panel = buildPanel(users);
-    container.appendChild(panel);
-
-    document.getElementById('imgcmp-refresh').addEventListener('click', refreshUsers);
-    document.getElementById('imgcmp-upgrade-chars').addEventListener('click', () => runJob(`${PLUGIN_BASE}/upgrade-characters`, 'characters'));
-    document.getElementById('imgcmp-compress-images').addEventListener('click', () => runJob(`${PLUGIN_BASE}/compress`, 'images'));
-    document.getElementById('imgcmp-reprocess-chars').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-characters`, 'characters'));
-    document.getElementById('imgcmp-reprocess-images').addEventListener('click', () => runJob(`${PLUGIN_BASE}/reprocess-all`, 'images'));
+    container.appendChild(buildPanel());
+    document.getElementById('imgcmp-convert').addEventListener('click', runConvert);
     document.getElementById('imgcmp-stats').addEventListener('click', runStats);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const available = await probePlugin();
+const tryInject = () => {
+    const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
+    if (!container) return false;
+    injectPanel(container);
+    return true;
+};
 
-if (!available) {
-    toastr.warning(
-        'Image Compressor server plugin is not available. If you just cloned it into '
-        + 'SillyTavern/plugins, run <b>npm install --omit=dev</b> in the plugin folder and '
-        + 'restart SillyTavern. (No build step is needed — the plugin ships pre-built.)',
-        'Image Compressor',
-        { timeOut: 0, closeButton: true, escapeHtml: false },
-    );
-} else {
-    const users = await fetchUsers();
-
-    const tryInject = () => {
-        const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
-        if (!container) return false;
-        injectPanel(users);
-        return true;
-    };
-
-    if (!tryInject()) {
-        const observer = new MutationObserver(() => {
-            if (tryInject()) observer.disconnect();
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
+if (!tryInject()) {
+    const observer = new MutationObserver(() => {
+        if (tryInject()) observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
 }
